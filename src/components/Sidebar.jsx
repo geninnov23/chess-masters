@@ -1,52 +1,57 @@
 import { Link } from "react-router";
 
-function Sidebar({ genres, activeGenre, counts }) {
+function Sidebar({ categories = [], activeCategory, onSelectCategory }) {
 	return (
 		<aside className="sidebar">
-			<div className="sidebar-title">Library</div>
+			<div className="sidebar-title">♟️ Chess Masters</div>
 
 			<nav className="sidebar-nav">
 				<Link
 					to="/"
 					className={
-						activeGenre === null ? "sidebar-link-active" : "sidebar-link"
+						activeCategory === null ? "sidebar-link-active" : "sidebar-link"
 					}
 				>
-					All Books
+					All Games
 				</Link>
 
-				<div className="sidebar-section">
-					<div className="sidebar-heading">Genres</div>
-					{genres.map((genre) => (
-						<Link
-							key={genre.name}
-							to={`/genre/${encodeURIComponent(genre.name)}`}
-							className={
-								activeGenre === genre.name
-									? "sidebar-link-active"
-									: "sidebar-link"
-							}
-						>
-							{genre.name}
-							{counts && (
-								<span className="ml-2 text-xs text-gray-900">
-									({genre.count})
+				{categories.length > 0 && (
+					<div className="sidebar-section">
+						<div className="sidebar-heading">Categories</div>
+						{categories.map((category) => (
+							<Link
+								key={category.name}
+								to={`/category/${encodeURIComponent(category.name)}`}
+								className={
+									activeCategory === category.name
+										? "sidebar-link-active"
+										: "sidebar-link"
+								}
+							>
+								{category.name}
+								<span className="ml-2 text-xs text-gray-500">
+									({category.count})
 								</span>
-							)}
-						</Link>
-					))}
-				</div>
+							</Link>
+						))}
+					</div>
+				)}
 			</nav>
 
 			<div className="mt-auto pt-6 px-6">
-				<div className="text-xs text-gray-900">
+				<div className="text-xs text-gray-600">
+					Learn chess by
+					<br />
+					playing master games
+					<br />
+					<br />
 					Powered by
 					<br />
 					<a
 						href="https://cloudflare.com"
 						target="_blank"
 						rel="noopener noreferrer"
-						className="text-blue-800 hover:underline"
+						className="text-blue-600 hover:underline"
 					>
 						Cloudflare
 					</a>

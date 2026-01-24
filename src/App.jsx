@@ -1,108 +1,94 @@
 import { useState, useEffect } from "react";
 import { useNavigate, useParams } from "react-router";
-import { groupByGenre } from "./lib/utils";
-import Breadcrumbs from "./components/Breadcrumbs";
 import Sidebar from "./components/Sidebar";
-import BooksList from "./components/BooksList";
-import BookDetail from "./components/BookDetail";
+import GamesList from "./components/GamesList";
+import PlayableBoard from "./components/PlayableBoard";
 import MockDataBanner from "./components/MockDataBanner";
 
 function App() {
 	const navigate = useNavigate();
 	const params = useParams();
-	const [bookDetail, setBookDetail] = useState(null);
+	const [gameDetail, setGameDetail] = useState(null);
 	const [loading, setLoading] = useState(false);
-	const [genres, setGenres] = useState([]);
+	const [categories, setCategories] = useState([]);
 	const [dataSource, setDataSource] = useState(null);
+	const [sortBy, setSortBy] = useState('event');
 
 	// Get route parameters
-	const { bookId } = params;
-	const { genreId } = params;
-	const activeGenre = genreId ? decodeURIComponent(genreId) : null;
+	const { gameId } = params;
+	const { categoryId } = params;
+	const activeCategory = categoryId ? decodeURIComponent(categoryId) : null;
 
-	// Load genres for sidebar
+	// Load categories for sidebar
 	useEffect(() => {
-		const loadGenres = async () => {
+		const loadCategories = async () => {
 			try {
-				const response = await fetch("/api/books");
+				const response = await fetch("/api/games");
 				if (!response.ok) {
 					throw new Error(`API returned status: ${response.status}`);
 				}
 				const data = await response.json();
 
-				if (!data.books?.length) {
-					console.error("No books data found:", typeof data);
+				if (!data.games?.length) {
+					console.error("No games data found:", typeof data);
 					return;
 				}
 
-				const booksArray = data.books;
-
 				// Check if using mock data or database
-				if (data.source) {
-					setDataSource(data.source);
+				if (data.dataSource) {
+					setDataSource(data.dataSource);
 				}
 
-				const genreGroups = groupByGenre(booksArray);
-				setGenres(genreGroups);
+				// Group by category
+				const categoryMap = {};
+				data.games.forEach(game => {
+					const cat = game.category || 'Uncategorized';
+					if (!categoryMap[cat]) {
+						categoryMap[cat] = { name: cat, count: 0 };
+					}
+					categoryMap[cat].count++;
+				});
+
+				const categoriesArray = Object.values(categoryMap).sort((a, b) =>
+					a.name.localeCompare(b.name)
+				);
+				setCategories(categoriesArray);
 			} catch (error) {
-				console.error("Error loading genres:", error);
+				console.error("Error loading categories:", error);
 			}
 		};
 
-		loadGenres();
+		loadCategories();
 	}, []);
 
-	// Load book details when a book is selected via URL
+	// Load game details when a game is selected via URL
 	useEffect(() => {
-		if (!bookId) return;
+		if (!gameId) return;
 
-		const fetchBookDetail = async () => {
+		const fetchGameDetail = async () => {
 			setLoading(true);
 			try {
-				// First get basic book details
-				const bookResponse = await fetch(`/api/books/${bookId}`);
+				const gameResponse = await fetch(`/api/games/${gameId}`);
 
-				if (!bookResponse.ok) {
-					throw new Error(`API returned status: ${bookResponse.status}`);
+				if (!gameResponse.ok) {
+					throw new Error(`API returned status: ${gameResponse.status}`);
 				}
 
-				const bookData = await bookResponse.json();
-
-				// Then get related books data
-				const relatedResponse = await fetch(`/api/books/${bookId}/related`);
-
-				if (!relatedResponse.ok) {
-					throw new Error(`API returned status: ${relatedResponse.status}`);
-				}
-
-				const relatedData = await relatedResponse.json();
-
-				// Combine the data
-				const combinedData = {
-					book: bookData.book,
-					relatedBooks: relatedData.relatedBooks,
-					recentRecommendations: relatedData.recentRecommendations,
-					genreStats: relatedData.genreStats,
-				};
-
-				setBookDetail(combinedData);
+				const gameData = await gameResponse.json();
+				setGameDetail(gameData.game);
 			} catch (error) {
-				console.error("Error fetching book details:", error);
+				console.error("Error fetching game details:", error);
 			} finally {
 				setLoading(false);
 			}
 		};
 
-		fetchBookDetail();
-	}, [bookId]);
+		fetchGameDetail();
+	}, [gameId]);
 
-	const handleSelectBook = (bookId) => {
-		navigate(`/book/${bookId}`);
-	};
-
-	const handleSelectGenre = (genre) => {
-		if (genre) {
-			navigate(`/genre/${encodeURIComponent(genre)}`);
+	const handleSelectCategory = (category) => {
+		if (category) {
+			navigate(`/category/${encodeURIComponent(category)}`);
 		} else {
 			navigate("/");
 		}
@@ -111,56 +97,57 @@ function App() {
 	return (
 		<div className="layout">
 			<Sidebar
-				genres={genres}
-				activeGenre={activeGenre}
-				onSelectGenre={handleSelectGenre}
-				counts
+				categories={categories}
+				activeCategory={activeCategory}
+				onSelectCategory={handleSelectCategory}
 			/>
 
 			<main className="main-content">
-				{/* Breadcrumbs for main library page */}
-				{!bookId && (
-					<Breadcrumbs
-						items={[
-							{ label: "All Books", value: null },
-							...(activeGenre
-								? [{ label: activeGenre, value: activeGenre }]
-								: []),
-						]}
-						onNavigate={(value) => {
-							if (value === null) {
-								handleSelectGenre(null);
-							}
-						}}
-					/>
-				)}
-
-				<div className="page-header">
-					<h1>{activeGenre ? `${activeGenre} Books` : "My Library"}</h1>
-					<p className="text-gray-900">
-						{activeGenre
-							? `Explore our collection of ${activeGenre.toLowerCase()} books`
-							: "Discover your next favorite book"}
-					</p>
-
-					{/* Show banner only when using mock data */}
-					{dataSource === "mock" && <MockDataBanner />}
-				</div>
-
-				{bookId ? (
+				{gameId ? (
 					loading ? (
 						<div className="flex justify-center items-center py-20">
 							<div className="h-10 w-10 border-2 border-blue-800 border-t-transparent rounded-full animate-spin"></div>
 						</div>
-					) : bookDetail ? (
-						<BookDetail bookData={bookDetail} />
+					) : gameDetail ? (
+						<PlayableBoard game={gameDetail} />
 					) : (
 						<div className="text-center py-20 text-gray-600">
-							Error loading book details
+							Error loading game
 						</div>
 					)
 				) : (
-					<BooksList onSelectBook={handleSelectBook} filter={activeGenre} />
+					<>
+						<div className="page-header">
+							<h1>{activeCategory ? activeCategory : "Chess Masters"}</h1>
+							<p className="text-gray-600">
+								{activeCategory
+									? `Learn from ${activeCategory.toLowerCase()}`
+									: "Learn chess by playing through master games"}
+							</p>
+
+							{/* Show banner only when using mock data */}
+							{dataSource === "mock" && <MockDataBanner />}
+						</div>
+
+						{/* Sort controls */}
+						<div className="mb-6 flex justify-end">
+							<select
+								value={sortBy}
+								onChange={(e) => setSortBy(e.target.value)}
+								className="px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+							>
+								<option value="event">Sort by Event</option>
+								<option value="white-asc">White (A-Z)</option>
+								<option value="white-desc">White (Z-A)</option>
+								<option value="black-asc">Black (A-Z)</option>
+								<option value="black-desc">Black (Z-A)</option>
+								<option value="date-asc">Date (Oldest)</option>
+								<option value="date-desc">Date (Newest)</option>
+							</select>
+						</div>
+
+						<GamesList category={activeCategory} sortBy={sortBy} />
+					</>
 				)}
 			</main>
 		</div>

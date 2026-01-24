@@ -20,7 +20,9 @@
 	},
 	"dependencies": {
 		"@tailwindcss/postcss": "4.1.17",
+		"chess.js": "^1.4.0",
 		"react": "19.2.1",
+		"react-chessboard": "^5.8.6",
 		"react-dom": "19.2.1",
 		"react-router": "7.9.6",
 		"react-router-dom": "7.9.6",
