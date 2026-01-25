@@ -17,6 +17,19 @@ export default function PlayableBoard({ game }) {
   const [hoveredSquare, setHoveredSquare] = useState(null);
   const [rightClickedSquares, setRightClickedSquares] = useState({});
   const [isDragging, setIsDragging] = useState(false);
+  const [showThreats, setShowThreats] = useState(false);
+  const [thinkAheadMode, setThinkAheadMode] = useState(false);
+  const [customArrows, setCustomArrows] = useState([]);
+  const [boardKey, setBoardKey] = useState(0);
+
+  // Gamification state
+  const [score, setScore] = useState(0);
+  const [streak, setStreak] = useState(0);
+  const [wrongAttempts, setWrongAttempts] = useState(0);
+  const [movesCompleted, setMovesCompleted] = useState(0);
+  const [patternDetected, setPatternDetected] = useState(null);
+  const [autoHintThreshold, setAutoHintThreshold] = useState(3); // Show hint after 3 wrong attempts
+  const [showHelp, setShowHelp] = useState(false);
 
   useEffect(() => {
     // Parse the PGN to extract all moves
@@ -33,25 +46,160 @@ export default function PlayableBoard({ game }) {
       setGameComplete(false);
       setFeedback('');
       setIsCorrect(null);
+      setCustomArrows([]);
+      setBoardKey(prev => prev + 1);
     }
   }, [game]);
+
+  // Force board remount when arrow modes change to fix rendering issues
+  useEffect(() => {
+    setBoardKey(prev => prev + 1);
+  }, [showThreats, thinkAheadMode]);
+
+  // Clear threat arrows when position changes (but keep custom arrows in think ahead mode)
+  useEffect(() => {
+    if (!thinkAheadMode) {
+      setCustomArrows([]);
+    }
+  }, [position, thinkAheadMode]);
 
   const getNextMasterMove = () => {
     return masterMoves[currentMoveIndex];
   };
 
+  const detectTacticalPattern = (move, afterMoveGame) => {
+    if (!move) return null;
+
+    // Use the provided game state after the move was made
+    const gameAfterMove = afterMoveGame || chessGameRef.current;
+
+    // Check for various patterns
+    const patterns = [];
+
+    // 1. Check (most obvious)
+    if (gameAfterMove.inCheck()) {
+      patterns.push({ type: 'check', points: 50, description: 'Check!' });
+    }
+
+    // 2. Checkmate
+    if (gameAfterMove.isCheckmate()) {
+      patterns.push({ type: 'checkmate', points: 500, description: 'Checkmate!' });
+    }
+
+    // 3. Capture
+    if (move.captured) {
+      const pieceValues = { p: 10, n: 30, b: 30, r: 50, q: 90, k: 0 };
+      const points = pieceValues[move.captured] || 10;
+      patterns.push({ type: 'capture', points, description: `Captured ${move.captured.toUpperCase()}` });
+    }
+
+    // 4. Fork detection (piece attacks multiple valuable pieces)
+    const attackedSquares = [];
+    const moves = gameAfterMove.moves({ verbose: true });
+    const attackingPieceMoves = moves.filter(m => m.from === move.to);
+
+    const valuableTargets = attackingPieceMoves.filter(m => {
+      const piece = gameAfterMove.get(m.to);
+      return piece && ['q', 'r', 'n', 'b'].includes(piece.type);
+    });
+
+    if (valuableTargets.length >= 2) {
+      patterns.push({ type: 'fork', points: 100, description: `Fork! Attacking ${valuableTargets.length} pieces` });
+    }
+
+    // 5. Discovered attack (moving reveals an attack from another piece)
+    // This is complex, but we can detect if moving created new attacks
+
+    // 6. Castling
+    if (move.flags && move.flags.includes('k')) {
+      patterns.push({ type: 'castle_kingside', points: 20, description: 'Castled Kingside' });
+    } else if (move.flags && move.flags.includes('q')) {
+      patterns.push({ type: 'castle_queenside', points: 20, description: 'Castled Queenside' });
+    }
+
+    // 7. Promotion
+    if (move.promotion) {
+      patterns.push({ type: 'promotion', points: 80, description: `Promoted to ${move.promotion.toUpperCase()}` });
+    }
+
+    return patterns.length > 0 ? patterns : null;
+  };
+
+  const calculateScore = (patterns, isFirstAttempt) => {
+    let points = 0;
+
+    // Base points for correct move
+    points += isFirstAttempt ? 100 : 50;
+
+    // Bonus for streak
+    points += streak * 10;
+
+    // Pattern bonuses
+    if (patterns) {
+      patterns.forEach(pattern => {
+        points += pattern.points;
+      });
+    }
+
+    return points;
+  };
+
+  const calculateThreats = () => {
+    if (!showThreats) return [];
+
+    const threats = [];
+    const moves = chessGameRef.current.moves({ verbose: true });
+
+    console.log('Calculating threats, total moves:', moves.length);
+
+    moves.forEach(move => {
+      // Check if move gives check
+      const tempGame = new Chess(chessGameRef.current.fen());
+      tempGame.move({ from: move.from, to: move.to, promotion: move.promotion });
+
+      if (tempGame.inCheck()) {
+        // Check arrows in red
+        console.log('Found check:', move.san, move.from, '->', move.to);
+        threats.push({
+          startSquare: move.from,
+          endSquare: move.to,
+          color: 'rgba(255, 0, 0, 0.8)' // Red for checks
+        });
+      } else if (move.captured) {
+        // Capture arrows in orange
+        console.log('Found capture:', move.san, move.from, '->', move.to);
+        threats.push({
+          startSquare: move.from,
+          endSquare: move.to,
+          color: 'rgba(255, 140, 0, 0.8)' // Orange for captures
+        });
+      }
+    });
+
+    console.log('Total threats found:', threats.length, threats);
+    return threats;
+  };
+
   const makeComputerMove = () => {
     const nextMove = getNextMasterMove();
-    if (!nextMove) return;
+    if (!nextMove) {
+      console.log('No more moves');
+      return;
+    }
 
     // Make the computer's move (opponent's move)
     setTimeout(() => {
       try {
-        chessGameRef.current.move({
+        const moveOptions = {
           from: nextMove.from,
-          to: nextMove.to,
-          promotion: nextMove.promotion
-        });
+          to: nextMove.to
+        };
+        if (nextMove.promotion) {
+          moveOptions.promotion = nextMove.promotion;
+        }
+
+        console.log('Computer making move:', moveOptions);
+        chessGameRef.current.move(moveOptions);
         setPosition(chessGameRef.current.fen());
         setCurrentMoveIndex(prev => prev + 1);
         setFeedback(`${nextMove.color === 'w' ? 'White' : 'Black'} played: ${nextMove.san}`);
@@ -63,6 +211,8 @@ export default function PlayableBoard({ game }) {
         }
       } catch (error) {
         console.error('Computer move error:', error);
+        console.log('Current FEN:', chessGameRef.current.fen());
+        console.log('Attempted move:', nextMove);
       }
     }, 500);
   };
@@ -102,11 +252,15 @@ export default function PlayableBoard({ game }) {
     const nextMove = getNextMasterMove();
     if (!nextMove) return false;
 
-    return (
-      nextMove.from === from &&
-      nextMove.to === to &&
-      (promotion ? nextMove.promotion === promotion : true)
-    );
+    // Check from and to squares match
+    const squaresMatch = nextMove.from === from && nextMove.to === to;
+
+    // Only check promotion if either move involves promotion
+    const promotionMatch = !nextMove.promotion && !promotion
+      ? true  // Neither move has promotion
+      : nextMove.promotion === promotion;  // Both must match
+
+    return squaresMatch && promotionMatch;
   };
 
   const onSquareClick = ({ square }) => {
@@ -139,19 +293,44 @@ export default function PlayableBoard({ game }) {
       }
 
       // Check if this is the correct move
-      const isCorrectMove = checkIfCorrectMove(moveFrom, square, foundMove.promotion || 'q');
+      const isCorrectMove = checkIfCorrectMove(moveFrom, square, foundMove.promotion);
 
       if (isCorrectMove) {
         // Correct move!
         try {
-          chessGameRef.current.move({
+          const moveOptions = {
             from: moveFrom,
-            to: square,
-            promotion: foundMove.promotion || 'q'
-          });
+            to: square
+          };
+          if (foundMove.promotion) {
+            moveOptions.promotion = foundMove.promotion;
+          }
+
+          // Make the move FIRST
+          chessGameRef.current.move(moveOptions);
+
+          // THEN detect tactical patterns
+          const patterns = detectTacticalPattern(foundMove, chessGameRef.current);
+          const isFirstAttempt = wrongAttempts === 0;
+          const earnedPoints = calculateScore(patterns, isFirstAttempt);
+
+          // Update gamification stats
+          setScore(prev => prev + earnedPoints);
+          setStreak(prev => prev + 1);
+          setMovesCompleted(prev => prev + 1);
+          setWrongAttempts(0);
+
+          // Show pattern feedback
+          let feedbackMsg = `✓ Correct! ${foundMove.san} (+${earnedPoints} points)`;
+          if (patterns && patterns.length > 0) {
+            const patternNames = patterns.map(p => p.description).join(', ');
+            feedbackMsg += ` - ${patternNames}`;
+            setPatternDetected(patterns);
+          }
+
           setPosition(chessGameRef.current.fen());
           setCurrentMoveIndex(prev => prev + 1);
-          setFeedback(`✓ Correct! ${foundMove.san}`);
+          setFeedback(feedbackMsg);
           setIsCorrect(true);
 
           // Clear highlights
@@ -161,21 +340,39 @@ export default function PlayableBoard({ game }) {
           // Make opponent's move
           setTimeout(() => {
             setIsCorrect(null);
+            setPatternDetected(null);
             makeComputerMove();
-          }, 1000);
+          }, 2000);
         } catch (error) {
           console.error('Move error:', error);
         }
       } else {
         // Wrong move
-        setFeedback('✗ Not the master move. Try again!');
+        const newWrongAttempts = wrongAttempts + 1;
+        setWrongAttempts(newWrongAttempts);
+        setStreak(0);
+
+        // Auto-show hint after threshold
+        if (newWrongAttempts >= autoHintThreshold) {
+          const nextMove = getNextMasterMove();
+          setFeedback(`✗ Try ${nextMove.san} (${nextMove.from} to ${nextMove.to})`);
+          setOptionSquares({
+            [nextMove.from]: { background: 'rgba(255, 215, 0, 0.7)' },
+            [nextMove.to]: { background: 'rgba(76, 175, 80, 0.7)' }
+          });
+        } else {
+          setFeedback(`✗ Wrong move! Try again. (${newWrongAttempts}/${autoHintThreshold})`);
+        }
+
         setIsCorrect(false);
         setMoveFrom('');
-        setOptionSquares({});
 
         setTimeout(() => {
-          setIsCorrect(null);
-          setFeedback('');
+          if (newWrongAttempts < autoHintThreshold) {
+            setIsCorrect(null);
+            setFeedback('');
+            setOptionSquares({});
+          }
         }, 2000);
       }
     }
@@ -183,7 +380,6 @@ export default function PlayableBoard({ game }) {
 
   const onPieceDrag = ({ square }) => {
     if (gameComplete) return;
-    console.log('Drag started:', square);
     // Set dragging state and show legal moves
     setIsDragging(true);
     setHoveredSquare(null);
@@ -194,13 +390,12 @@ export default function PlayableBoard({ game }) {
   const onPieceDrop = ({ sourceSquare, targetSquare }) => {
     console.log('=== DROP ATTEMPT ===');
     console.log('Source:', sourceSquare, 'Target:', targetSquare);
-    console.log('Game complete:', gameComplete);
 
     // Clear dragging state
     setIsDragging(false);
 
     if (gameComplete || !targetSquare) {
-      console.log('Rejected: game complete or no target');
+      console.log('REJECTED: Game complete or no target');
       setOptionSquares({});
       setMoveFrom('');
       return false;
@@ -212,40 +407,111 @@ export default function PlayableBoard({ game }) {
       verbose: true
     });
 
-    console.log('Legal moves for', sourceSquare, ':', moves.map(m => m.to));
+    console.log('Legal moves:', moves.map(m => `${m.from}->${m.to} (${m.san})`));
     const foundMove = moves.find(m => m.from === sourceSquare && m.to === targetSquare);
     console.log('Found move:', foundMove);
 
     if (!foundMove) {
-      console.log('Rejected: not a legal chess move');
+      console.log('REJECTED: Not a legal chess move');
       setOptionSquares({});
       setMoveFrom('');
       return false;
     }
 
-    // TEMPORARY: Allow any legal move to test drag & drop
-    console.log('Attempting to make move:', foundMove.san);
+    // Check if this matches the master move
+    const nextMasterMove = getNextMasterMove();
+    console.log('Next master move:', nextMasterMove);
+    console.log('Current move index:', currentMoveIndex);
 
-    try {
-      chessGameRef.current.move({
-        from: sourceSquare,
-        to: targetSquare,
-        promotion: foundMove.promotion || 'q'
-      });
+    const isCorrectMove = checkIfCorrectMove(sourceSquare, targetSquare, foundMove.promotion);
+    console.log('Is correct move?', isCorrectMove);
 
-      console.log('Move successful!');
-      setPosition(chessGameRef.current.fen());
-      setFeedback(`Moved: ${foundMove.san}`);
-      setIsCorrect(null);
+    if (isCorrectMove) {
+      console.log('✓ CORRECT MOVE! Making move...');
+      try {
+        const moveOptions = {
+          from: sourceSquare,
+          to: targetSquare
+        };
+        if (foundMove.promotion) {
+          moveOptions.promotion = foundMove.promotion;
+        }
 
+        // Make the move FIRST
+        chessGameRef.current.move(moveOptions);
+
+        // THEN detect tactical patterns using the updated game state
+        const patterns = detectTacticalPattern(foundMove, chessGameRef.current);
+        const isFirstAttempt = wrongAttempts === 0;
+        const earnedPoints = calculateScore(patterns, isFirstAttempt);
+
+        // Update gamification stats
+        setScore(prev => prev + earnedPoints);
+        setStreak(prev => prev + 1);
+        setMovesCompleted(prev => prev + 1);
+        setWrongAttempts(0); // Reset wrong attempts
+
+        // Show pattern feedback
+        let feedbackMsg = `✓ Correct! ${foundMove.san} (+${earnedPoints} points)`;
+        if (patterns && patterns.length > 0) {
+          const patternNames = patterns.map(p => p.description).join(', ');
+          feedbackMsg += ` - ${patternNames}`;
+          setPatternDetected(patterns);
+        }
+
+        setPosition(chessGameRef.current.fen());
+        setCurrentMoveIndex(prev => prev + 1);
+        setFeedback(feedbackMsg);
+        setIsCorrect(true);
+
+        setMoveFrom('');
+        setOptionSquares({});
+
+        console.log('Move successful! New position:', chessGameRef.current.fen());
+
+        setTimeout(() => {
+          setIsCorrect(null);
+          setPatternDetected(null);
+          makeComputerMove();
+        }, 2000);
+
+        return true;
+      } catch (error) {
+        console.error('ERROR making move:', error);
+        setOptionSquares({});
+        setMoveFrom('');
+        return false;
+      }
+    } else {
+      console.log('✗ WRONG MOVE!');
+
+      const newWrongAttempts = wrongAttempts + 1;
+      setWrongAttempts(newWrongAttempts);
+      setStreak(0); // Break streak on wrong move
+
+      // Auto-show hint after threshold
+      if (newWrongAttempts >= autoHintThreshold) {
+        const nextMove = getNextMasterMove();
+        setFeedback(`✗ Try ${nextMove.san} (${nextMove.from} to ${nextMove.to})`);
+        setOptionSquares({
+          [nextMove.from]: { background: 'rgba(255, 215, 0, 0.7)' },
+          [nextMove.to]: { background: 'rgba(76, 175, 80, 0.7)' }
+        });
+      } else {
+        setFeedback(`✗ Wrong move! Try again. (${newWrongAttempts}/${autoHintThreshold})`);
+      }
+
+      setIsCorrect(false);
       setMoveFrom('');
-      setOptionSquares({});
 
-      return true;
-    } catch (error) {
-      console.error('ERROR making move:', error);
-      setOptionSquares({});
-      setMoveFrom('');
+      setTimeout(() => {
+        if (newWrongAttempts < autoHintThreshold) {
+          setIsCorrect(null);
+          setFeedback('');
+          setOptionSquares({});
+        }
+      }, 2000);
+
       return false;
     }
   };
@@ -260,6 +526,15 @@ export default function PlayableBoard({ game }) {
     setFeedback('');
     setIsCorrect(null);
     setGameComplete(false);
+    setCustomArrows([]);
+    setRightClickedSquares({});
+
+    // Reset gamification stats
+    setScore(0);
+    setStreak(0);
+    setWrongAttempts(0);
+    setMovesCompleted(0);
+    setPatternDetected(null);
   };
 
   const goToNextMove = () => {
@@ -363,7 +638,36 @@ export default function PlayableBoard({ game }) {
       };
     }
 
+    // Combine all arrows: threats + custom arrows
+    const threatArrows = calculateThreats();
+
+    // Validate arrows - ensure all required fields are present
+    const validatedArrows = [
+      ...threatArrows,
+      ...customArrows
+    ].filter(arrow => {
+      const isValid = arrow &&
+        typeof arrow.startSquare === 'string' &&
+        typeof arrow.endSquare === 'string' &&
+        arrow.startSquare.length === 2 &&
+        arrow.endSquare.length === 2 &&
+        typeof arrow.color === 'string';
+
+      if (!isValid) {
+        console.warn('Invalid arrow:', arrow);
+      }
+      return isValid;
+    });
+
+    const allArrows = validatedArrows;
+
+    if (allArrows.length > 0) {
+      console.log('All arrows:', allArrows.length, '(Threats:', threatArrows.length, 'Custom:', customArrows.length, ')');
+      console.log('Arrow samples:', allArrows.slice(0, 2));
+    }
+
     return {
+      id: 'main-chessboard',
       position: position,
       onSquareClick: onSquareClick,
       onPieceDrag: onPieceDrag,
@@ -373,9 +677,23 @@ export default function PlayableBoard({ game }) {
       // onMouseOutSquare: onMouseOutSquare,
       onSquareRightClick: onSquareRightClick,
       squareStyles: styles,
-      boardWidth: 560,
       animationDurationInMs: 300,
       allowDragging: !gameComplete,
+      allowDrawingArrows: thinkAheadMode, // Enable arrow drawing in think ahead mode
+      arrows: allArrows.length > 0 ? allArrows : undefined, // Only pass arrows if we have any
+      onArrowsChange: thinkAheadMode ? ({ arrows }) => {
+        console.log('Arrows changed by user:', arrows);
+        setCustomArrows(arrows);
+      } : undefined,
+      clearArrowsOnClick: false, // Don't clear arrows on click
+      clearArrowsOnPositionChange: false, // Never auto-clear, we manage manually
+      arrowOptions: {
+        color: '#4169E1', // Royal blue for thinking ahead
+        secondaryColor: '#32CD32', // Lime green for shift+drag
+        tertiaryColor: '#FFD700', // Gold for ctrl+drag
+        opacity: 0.8,
+        activeOpacity: 0.9,
+      },
       draggingPieceStyle: {
         transform: 'scale(1.3)',
         filter: 'drop-shadow(0px 8px 12px rgba(0, 0, 0, 0.4))',
@@ -401,7 +719,7 @@ export default function PlayableBoard({ game }) {
       showAnimations: true,
       dragActivationDistance: 3
     };
-  }, [position, optionSquares, rightClickedSquares, hoveredSquare, moveFrom, gameComplete, isDragging]);
+  }, [position, optionSquares, rightClickedSquares, hoveredSquare, moveFrom, gameComplete, isDragging, showThreats, thinkAheadMode, customArrows]);
 
   if (!game) {
     return <div className="text-center py-12">Loading game...</div>;
@@ -416,24 +734,50 @@ export default function PlayableBoard({ game }) {
         ]}
       />
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 mt-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 mt-6">
         {/* Chess Board */}
-        <div className="lg:col-span-2">
-          <div className="bg-white rounded-lg shadow-lg p-6">
-            {/* Instructions */}
-            {!gameComplete && currentMoveIndex === 0 && (
-              <div className="mb-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
-                <h3 className="font-semibold text-blue-900 mb-2">How to Play</h3>
-                <ul className="text-sm text-blue-800 space-y-1">
-                  <li>• <strong>Drag & Drop</strong> pieces or <strong>click</strong> a piece then click the destination square</li>
-                  <li>• <strong>Right-click</strong> squares to mark them with red highlights</li>
-                  <li>• Try to replicate the moves from the master game</li>
-                  <li>• Use the <strong>Show Hint</strong> button if you get stuck</li>
-                </ul>
+        <div className="lg:col-span-1">
+          <div className="bg-white rounded-lg shadow-lg p-4">
+            {/* Compact Header with Help */}
+            <div className="flex items-center justify-between mb-3">
+              <div className="text-sm text-gray-600">
+                Move {Math.floor(currentMoveIndex / 2) + 1} of {Math.ceil(masterMoves.length / 2)}
               </div>
-            )}
 
-            <Chessboard options={chessboardOptions} />
+              {/* Help Button */}
+              <div className="relative">
+                <button
+                  onClick={() => setShowHelp(!showHelp)}
+                  onMouseEnter={() => setShowHelp(true)}
+                  onMouseLeave={() => setShowHelp(false)}
+                  className="w-8 h-8 rounded-full bg-blue-100 hover:bg-blue-200 text-blue-600 flex items-center justify-center transition-colors"
+                  title="How to Play"
+                >
+                  ?
+                </button>
+
+                {/* Help Tooltip */}
+                {showHelp && (
+                  <div className="absolute right-0 top-10 w-72 bg-white border-2 border-blue-200 rounded-lg shadow-xl p-4 z-50">
+                    <h3 className="font-bold text-blue-900 mb-2">How to Play</h3>
+                    <ul className="text-xs text-gray-700 space-y-1">
+                      <li>• <strong>Drag & Drop</strong> or <strong>click-to-move</strong> pieces</li>
+                      <li>• Replicate the master's moves to earn points</li>
+                      <li>• Build streaks for bonus points 🔥</li>
+                      <li>• After 3 wrong moves, auto-hint appears</li>
+                      <li>• <strong>Think Ahead</strong>: Draw arrows (right-click drag)</li>
+                      <li>• <strong>Show Threats</strong>: See checks/captures</li>
+                    </ul>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <Chessboard
+              key={`board-${boardKey}`}
+              id="main-chessboard"
+              options={chessboardOptions}
+            />
 
             {/* Feedback */}
             {feedback && (
@@ -447,58 +791,139 @@ export default function PlayableBoard({ game }) {
                 {feedback}
               </div>
             )}
-
-            {/* Controls */}
-            <div className="mt-4 space-y-3">
-              {/* Navigation Controls */}
-              <div className="flex gap-2 justify-center">
-                <button
-                  onClick={goToPreviousMove}
-                  disabled={currentMoveIndex === 0}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-                  title="Previous Move"
-                >
-                  <span>←</span>
-                  <span>Previous</span>
-                </button>
-                <button
-                  onClick={goToNextMove}
-                  disabled={currentMoveIndex >= masterMoves.length}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-                  title="Next Move"
-                >
-                  <span>Next</span>
-                  <span>→</span>
-                </button>
-              </div>
-
-              {/* Action Controls */}
-              <div className="flex gap-3">
-                <button
-                  onClick={resetGame}
-                  className="btn flex-1 px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-colors"
-                >
-                  Reset Game
-                </button>
-                <button
-                  onClick={showHint}
-                  disabled={gameComplete}
-                  className="btn flex-1 px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  Show Hint
-                </button>
-              </div>
-            </div>
-
-            {/* Progress */}
-            <div className="mt-4 text-sm text-gray-600 text-center">
-              Move {Math.floor(currentMoveIndex / 2) + 1} of {Math.ceil(masterMoves.length / 2)}
-            </div>
           </div>
         </div>
 
         {/* Game Info */}
-        <div className="lg:col-span-1">
+        <div className="lg:col-span-1 space-y-6">
+          {/* Gamification Panel */}
+          <div className="bg-gradient-to-br from-purple-500 to-indigo-600 rounded-lg shadow-lg p-4 text-white">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-lg font-bold flex items-center gap-2">
+                🎮 Progress
+              </h3>
+              <div className="text-right">
+                <div className="text-2xl font-bold">{score}</div>
+                <div className="text-xs opacity-75">points</div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 mb-3">
+              <div className="bg-white/20 rounded p-2 text-center backdrop-blur">
+                <div className="text-lg font-bold">🔥{streak}</div>
+                <div className="text-xs opacity-90">Streak</div>
+              </div>
+              <div className="bg-white/20 rounded p-2 text-center backdrop-blur">
+                <div className="text-lg font-bold">{movesCompleted}</div>
+                <div className="text-xs opacity-90">Moves</div>
+              </div>
+              <div className="bg-white/20 rounded p-2 text-center backdrop-blur">
+                <div className="text-lg font-bold">
+                  {movesCompleted > 0 ? Math.round((movesCompleted / (movesCompleted + (streak === 0 && wrongAttempts > 0 ? 1 : 0))) * 100) : 100}%
+                </div>
+                <div className="text-xs opacity-90">Accuracy</div>
+              </div>
+            </div>
+
+            {/* Pattern Achievement */}
+            {patternDetected && patternDetected.length > 0 && (
+              <div className="bg-yellow-400 text-yellow-900 rounded-lg p-2 animate-pulse mb-2">
+                <div className="font-bold text-xs mb-1">🎯 Tactical!</div>
+                {patternDetected.map((pattern, idx) => (
+                  <div key={idx} className="text-xs">
+                    +{pattern.points} {pattern.description}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Auto-hint indicator */}
+            {wrongAttempts > 0 && wrongAttempts < autoHintThreshold && (
+              <div className="bg-orange-400 text-orange-900 rounded p-1.5 text-xs">
+                {autoHintThreshold - wrongAttempts} more {autoHintThreshold - wrongAttempts === 1 ? 'try' : 'tries'} → auto-hint
+              </div>
+            )}
+          </div>
+
+          {/* Controls Section */}
+          <div className="bg-white rounded-lg shadow-lg p-4 space-y-3">
+            <h3 className="font-bold text-gray-800 mb-3">Controls</h3>
+
+            {/* Navigation */}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={goToPreviousMove}
+                disabled={currentMoveIndex === 0}
+                className="px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium"
+                title="Previous Move"
+              >
+                ← Prev
+              </button>
+              <button
+                onClick={goToNextMove}
+                disabled={currentMoveIndex >= masterMoves.length}
+                className="px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium"
+                title="Next Move"
+              >
+                Next →
+              </button>
+            </div>
+
+            {/* Actions */}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={resetGame}
+                className="px-3 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-colors text-sm font-medium"
+                title="Reset Game"
+              >
+                🔄 Reset
+              </button>
+              <button
+                onClick={showHint}
+                disabled={gameComplete}
+                className="px-3 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 transition-colors disabled:opacity-50 text-sm font-medium"
+                title="Show Hint"
+              >
+                💡 Hint
+              </button>
+            </div>
+
+            {/* Analysis Tools */}
+            <div className="space-y-2">
+              <button
+                onClick={() => setThinkAheadMode(!thinkAheadMode)}
+                className={`w-full px-3 py-2 rounded text-sm font-medium transition-colors ${
+                  thinkAheadMode
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                }`}
+                title="Right-click drag to draw arrows"
+              >
+                {thinkAheadMode ? '✓' : ''} 🎯 Think Ahead Mode
+              </button>
+              <button
+                onClick={() => setShowThreats(!showThreats)}
+                className={`w-full px-3 py-2 rounded text-sm font-medium transition-colors ${
+                  showThreats
+                    ? 'bg-purple-600 text-white'
+                    : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                }`}
+                title="Show checks (red) and captures (orange)"
+              >
+                {showThreats ? '✓' : ''} ⚠️ Show Threats
+              </button>
+              {thinkAheadMode && customArrows.length > 0 && (
+                <button
+                  onClick={() => setCustomArrows([])}
+                  className="w-full px-3 py-2 bg-red-600 text-white rounded text-sm font-medium hover:bg-red-700"
+                  title="Clear all drawn arrows"
+                >
+                  Clear Arrows ({customArrows.length})
+                </button>
+              )}
+            </div>
+          </div>
+
           <div className="bg-white rounded-lg shadow-lg p-6">
             <h2 className="text-2xl font-bold mb-4">{game.white} vs {game.black}</h2>
 
