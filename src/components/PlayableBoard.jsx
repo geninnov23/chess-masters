@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import { Chess } from 'chess.js';
 import { Chessboard } from 'react-chessboard';
 import Breadcrumbs from './Breadcrumbs';
+import AuthGate from './AuthGate';
 
 export default function PlayableBoard({ game }) {
   const chessGameRef = useRef(new Chess());
@@ -17,9 +18,9 @@ export default function PlayableBoard({ game }) {
   const [hoveredSquare, setHoveredSquare] = useState(null);
   const [rightClickedSquares, setRightClickedSquares] = useState({});
   const [isDragging, setIsDragging] = useState(false);
-  const [showThreats, setShowThreats] = useState(false);
+  const [showThreats, setShowThreats] = useState(true);
   const [thinkAheadMode, setThinkAheadMode] = useState(false);
-  const [customArrows, setCustomArrows] = useState([]);
+  const [thinkAheadDepth, setThinkAheadDepth] = useState(3); // Number of moves to show ahead
   const [boardKey, setBoardKey] = useState(0);
 
   // Gamification state
@@ -30,6 +31,56 @@ export default function PlayableBoard({ game }) {
   const [patternDetected, setPatternDetected] = useState(null);
   const [autoHintThreshold, setAutoHintThreshold] = useState(3); // Show hint after 3 wrong attempts
   const [showHelp, setShowHelp] = useState(false);
+
+  // Accuracy & per-game progress
+  const [totalWrongAttempts, setTotalWrongAttempts] = useState(0);
+  const [gameProgress, setGameProgress] = useState({ bestScore: 0, completions: 0, lastAccuracy: 0 });
+
+  // Study mode
+  const [autoPlayOpponent, setAutoPlayOpponent] = useState(true);
+  const [playingAs, setPlayingAs] = useState('white'); // 'white' | 'black'
+
+  // ── localStorage helpers ──────────────────────────────────────────
+  const progressKey = `chess-masters-progress-${game?.id}`;
+
+  const loadProgress = () => {
+    try {
+      const raw = localStorage.getItem(progressKey);
+      return raw ? JSON.parse(raw) : { bestScore: 0, completions: 0, lastAccuracy: 0 };
+    } catch { return { bestScore: 0, completions: 0, lastAccuracy: 0 }; }
+  };
+
+  const saveProgress = (finalScore, accuracy) => {
+    try {
+      const prev = loadProgress();
+      const next = {
+        bestScore: Math.max(prev.bestScore, finalScore),
+        completions: (prev.completions || 0) + 1,
+        lastAccuracy: accuracy,
+        lastPlayed: new Date().toISOString(),
+      };
+      localStorage.setItem(progressKey, JSON.stringify(next));
+      setGameProgress(next);
+    } catch (_) {}
+  };
+
+  // Load progress when a game opens
+  useEffect(() => {
+    if (game?.id) setGameProgress(loadProgress());
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [game?.id]);
+
+  // Save progress when game completes
+  useEffect(() => {
+    if (!gameComplete) return;
+    const accuracy = movesCompleted > 0
+      ? Math.round((movesCompleted / (movesCompleted + totalWrongAttempts)) * 100)
+      : 100;
+    saveProgress(score, accuracy);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameComplete]);
+
+  // ─────────────────────────────────────────────────────────────────
 
   useEffect(() => {
     // Parse the PGN to extract all moves
@@ -46,22 +97,27 @@ export default function PlayableBoard({ game }) {
       setGameComplete(false);
       setFeedback('');
       setIsCorrect(null);
-      setCustomArrows([]);
       setBoardKey(prev => prev + 1);
     }
   }, [game]);
 
-  // Force board remount when arrow modes change to fix rendering issues
+  // When switching to "play as Black" (or enabling auto-play while already Black),
+  // reset to the start and let White's first move play automatically.
   useEffect(() => {
-    setBoardKey(prev => prev + 1);
-  }, [showThreats, thinkAheadMode]);
+    if (!autoPlayOpponent || playingAs !== 'black' || masterMoves.length === 0) return;
 
-  // Clear threat arrows when position changes (but keep custom arrows in think ahead mode)
-  useEffect(() => {
-    if (!thinkAheadMode) {
-      setCustomArrows([]);
-    }
-  }, [position, thinkAheadMode]);
+    chessGameRef.current.reset();
+    setPosition(chessGameRef.current.fen());
+    setCurrentMoveIndex(0);
+    setFeedback('');
+    setIsCorrect(null);
+    setGameComplete(false);
+    setMoveFrom('');
+    setOptionSquares({});
+
+    playMasterMoveAt(0, masterMoves);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playingAs, autoPlayOpponent, masterMoves]);
 
   const getNextMasterMove = () => {
     return masterMoves[currentMoveIndex];
@@ -144,40 +200,169 @@ export default function PlayableBoard({ game }) {
     return points;
   };
 
+  const calculateThinkAheadArrows = () => {
+    if (!thinkAheadMode) return [];
+
+    // react-chessboard v5 Arrow type: { startSquare: string, endSquare: string, color: string }
+    const arrowColors = [
+      '#4169E1',  // Royal blue  — move 1
+      '#22C55E',  // Green       — move 2
+      '#FFD700',  // Gold        — move 3
+      '#FF69B4',  // Hot pink    — move 4
+      '#8B2BE2',  // Purple      — move 5
+    ];
+
+    const arrows = [];
+    for (let i = 0; i < thinkAheadDepth && currentMoveIndex + i < masterMoves.length; i++) {
+      const move = masterMoves[currentMoveIndex + i];
+      arrows.push({
+        startSquare: move.from,
+        endSquare: move.to,
+        color: arrowColors[i % arrowColors.length],
+      });
+    }
+    return arrows;
+  };
+
   const calculateThreats = () => {
-    if (!showThreats) return [];
+    if (!showThreats) return { arrows: [], squareStyles: {}, squareCounts: {} };
 
-    const threats = [];
-    const moves = chessGameRef.current.moves({ verbose: true });
+    const currentFen = chessGameRef.current.fen();
+    const currentMoves = chessGameRef.current.moves({ verbose: true });
+    const currentTurn = chessGameRef.current.turn(); // 'w' or 'b'
+    const board = chessGameRef.current.board();
 
-    console.log('Calculating threats, total moves:', moves.length);
+    // Opponent moves via FEN-swap (swap active colour + clear en-passant)
+    let opponentMoves = [];
+    try {
+      const parts = currentFen.split(' ');
+      parts[1] = parts[1] === 'w' ? 'b' : 'w';
+      parts[3] = '-';
+      opponentMoves = new Chess(parts.join(' ')).moves({ verbose: true });
+    } catch (_) {}
 
-    moves.forEach(move => {
-      // Check if move gives check
-      const tempGame = new Chess(chessGameRef.current.fen());
-      tempGame.move({ from: move.from, to: move.to, promotion: move.promotion });
+    // Capture arrows: red = what current player can take, orange = what opponent threatens
+    const arrows = [];
+    currentMoves.filter(m => m.captured)
+      .forEach(m => arrows.push({ startSquare: m.from, endSquare: m.to, color: '#FF3C3C' }));
+    opponentMoves.filter(m => m.captured)
+      .forEach(m => arrows.push({ startSquare: m.from, endSquare: m.to, color: '#FFA500' }));
 
-      if (tempGame.inCheck()) {
-        // Check arrows in red
-        console.log('Found check:', move.san, move.from, '->', move.to);
-        threats.push({
-          startSquare: move.from,
-          endSquare: move.to,
-          color: 'rgba(255, 0, 0, 0.8)' // Red for checks
-        });
-      } else if (move.captured) {
-        // Capture arrows in orange
-        console.log('Found capture:', move.san, move.from, '->', move.to);
-        threats.push({
-          startSquare: move.from,
-          endSquare: move.to,
-          color: 'rgba(255, 140, 0, 0.8)' // Orange for captures
-        });
+    // Attacker counts — only captures, indexed by destination square
+    const currentAttacksTo = {};
+    currentMoves.filter(m => m.captured)
+      .forEach(m => { currentAttacksTo[m.to] = (currentAttacksTo[m.to] || 0) + 1; });
+    const opponentAttacksTo = {};
+    opponentMoves.filter(m => m.captured)
+      .forEach(m => { opponentAttacksTo[m.to] = (opponentAttacksTo[m.to] || 0) + 1; });
+
+    // ── Defender counting ────────────────────────────────────────────
+    // chess.js never generates moves TO a square occupied by a friendly piece,
+    // so `currentAttacksTo[X]` is always 0 for own pieces.
+    // Fix: for each occupied square, temporarily replace the piece with a dummy
+    // opponent pawn in the FEN, then count how many of the piece's own colour
+    // can capture onto that square → those are the true defenders.
+    const countDefenders = (square, pieceColor, row, col) => {
+      // Kings: skip (removing the king from the FEN produces an invalid position)
+      if (board[row][col]?.type === 'k') return 0;
+      try {
+        const parts = currentFen.split(' ');
+        const fenRows = parts[0].split('/');
+
+        // Expand the FEN row into individual characters (using '.' for empty)
+        let expanded = '';
+        for (const ch of fenRows[row]) {
+          expanded += /\d/.test(ch) ? '.'.repeat(parseInt(ch)) : ch;
+        }
+        // Replace the piece at `col` with a dummy opponent pawn
+        const chars = expanded.split('');
+        chars[col] = pieceColor === 'w' ? 'p' : 'P'; // opponent-coloured pawn
+
+        // Compress back to FEN notation
+        let compressed = '';
+        let empties = 0;
+        for (const ch of chars) {
+          if (ch === '.') { empties++; }
+          else { if (empties) { compressed += empties; empties = 0; } compressed += ch; }
+        }
+        if (empties) compressed += empties;
+
+        fenRows[row] = compressed;
+        parts[0] = fenRows.join('/');
+        parts[1] = pieceColor; // set turn to the piece's own colour
+        parts[3] = '-';        // clear en-passant
+
+        const game = new Chess(parts.join(' '));
+        // Count captures by pieceColor onto this square = number of defenders
+        return game.moves({ verbose: true })
+          .filter(m => m.to === square && m.captured)
+          .length;
+      } catch (_) {
+        return 0;
       }
-    });
+    };
 
-    console.log('Total threats found:', threats.length, threats);
-    return threats;
+    // Build per-square attacker/defender counts and colour styles
+    const squareCounts = {};
+    const squareStyles = {};
+
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const piece = board[row][col];
+        if (!piece) continue;
+
+        const file = String.fromCharCode('a'.charCodeAt(0) + col);
+        const rank = 8 - row;
+        const square = `${file}${rank}`;
+
+        const attackers = piece.color === currentTurn
+          ? (opponentAttacksTo[square] || 0)  // opponent attacks our piece
+          : (currentAttacksTo[square] || 0);  // we attack opponent's piece
+
+        if (attackers === 0) continue; // un-attacked — nothing to show
+
+        const defenders = countDefenders(square, piece.color, row, col);
+
+        squareCounts[square] = { attackers, defenders };
+
+        const net = attackers - defenders;
+        let bg;
+        if (net >= 2)       bg = 'rgba(220, 38, 38, 0.55)';  // severely hanging
+        else if (net === 1) bg = 'rgba(239, 68, 68, 0.38)';  // lightly hanging
+        else if (net === 0) bg = 'rgba(245, 158, 11, 0.40)'; // contested
+        else                bg = 'rgba(34, 197, 94, 0.28)';  // well defended
+
+        squareStyles[square] = { background: bg };
+      }
+    }
+
+    return { arrows, squareStyles, squareCounts };
+  };
+
+  // Auto-plays the master move at `index`. Accepts an explicit index to avoid
+  // stale-closure bugs that plagued the old makeComputerMove().
+  const playMasterMoveAt = (index, moves = masterMoves) => {
+    const move = moves[index];
+    if (!move) return;
+
+    setTimeout(() => {
+      try {
+        const moveOptions = { from: move.from, to: move.to };
+        if (move.promotion) moveOptions.promotion = move.promotion;
+
+        chessGameRef.current.move(moveOptions);
+        setPosition(chessGameRef.current.fen());
+        setCurrentMoveIndex(index + 1);
+        setFeedback(`${move.color === 'w' ? '♔ White' : '♚ Black'} played ${move.san}`);
+
+        if (index + 1 >= moves.length) {
+          setGameComplete(true);
+          setFeedback('Game complete! Well done!');
+        }
+      } catch (error) {
+        console.error('Auto-play error:', error, move);
+      }
+    }, 650);
   };
 
   const makeComputerMove = () => {
@@ -266,6 +451,12 @@ export default function PlayableBoard({ game }) {
   const onSquareClick = ({ square }) => {
     if (gameComplete) return;
 
+    // Block input when it is the opponent's turn in auto-play mode
+    if (autoPlayOpponent) {
+      const turn = chessGameRef.current.turn(); // 'w' or 'b'
+      if ((playingAs === 'white' && turn === 'b') || (playingAs === 'black' && turn === 'w')) return;
+    }
+
     const piece = chessGameRef.current.get(square);
 
     // First click - selecting a piece
@@ -328,8 +519,11 @@ export default function PlayableBoard({ game }) {
             setPatternDetected(patterns);
           }
 
+          // Capture opponent index BEFORE the state update (avoids stale closure)
+          const opponentMoveIndex = currentMoveIndex + 1;
+
           setPosition(chessGameRef.current.fen());
-          setCurrentMoveIndex(prev => prev + 1);
+          setCurrentMoveIndex(opponentMoveIndex);
           setFeedback(feedbackMsg);
           setIsCorrect(true);
 
@@ -337,31 +531,36 @@ export default function PlayableBoard({ game }) {
           setMoveFrom('');
           setOptionSquares({});
 
-          // Make opponent's move
+          // Auto-play opponent's response if enabled
           setTimeout(() => {
             setIsCorrect(null);
             setPatternDetected(null);
-            makeComputerMove();
-          }, 2000);
+            if (autoPlayOpponent) {
+              playMasterMoveAt(opponentMoveIndex);
+            }
+          }, 1200);
         } catch (error) {
           console.error('Move error:', error);
         }
       } else {
-        // Wrong move
+        // Wrong move — deduct points and track
         const newWrongAttempts = wrongAttempts + 1;
+        const WRONG_PENALTY = 25;
         setWrongAttempts(newWrongAttempts);
+        setTotalWrongAttempts(prev => prev + 1);
         setStreak(0);
+        setScore(prev => Math.max(0, prev - WRONG_PENALTY));
 
         // Auto-show hint after threshold
         if (newWrongAttempts >= autoHintThreshold) {
           const nextMove = getNextMasterMove();
-          setFeedback(`✗ Try ${nextMove.san} (${nextMove.from} to ${nextMove.to})`);
+          setFeedback(`✗ Wrong! -${WRONG_PENALTY} pts. Hint: ${nextMove.san} (${nextMove.from}→${nextMove.to})`);
           setOptionSquares({
             [nextMove.from]: { background: 'rgba(255, 215, 0, 0.7)' },
             [nextMove.to]: { background: 'rgba(76, 175, 80, 0.7)' }
           });
         } else {
-          setFeedback(`✗ Wrong move! Try again. (${newWrongAttempts}/${autoHintThreshold})`);
+          setFeedback(`✗ Wrong move! -${WRONG_PENALTY} pts. (${newWrongAttempts}/${autoHintThreshold} before hint)`);
         }
 
         setIsCorrect(false);
@@ -393,6 +592,16 @@ export default function PlayableBoard({ game }) {
 
     // Clear dragging state
     setIsDragging(false);
+
+    // Block input when it is the opponent's turn in auto-play mode
+    if (autoPlayOpponent) {
+      const turn = chessGameRef.current.turn();
+      if ((playingAs === 'white' && turn === 'b') || (playingAs === 'black' && turn === 'w')) {
+        setOptionSquares({});
+        setMoveFrom('');
+        return false;
+      }
+    }
 
     if (gameComplete || !targetSquare) {
       console.log('REJECTED: Game complete or no target');
@@ -459,21 +668,25 @@ export default function PlayableBoard({ game }) {
           setPatternDetected(patterns);
         }
 
+        // Capture opponent index BEFORE the state update (avoids stale closure)
+        const opponentMoveIndex = currentMoveIndex + 1;
+
         setPosition(chessGameRef.current.fen());
-        setCurrentMoveIndex(prev => prev + 1);
+        setCurrentMoveIndex(opponentMoveIndex);
         setFeedback(feedbackMsg);
         setIsCorrect(true);
 
         setMoveFrom('');
         setOptionSquares({});
 
-        console.log('Move successful! New position:', chessGameRef.current.fen());
-
+        // Auto-play opponent's response if enabled
         setTimeout(() => {
           setIsCorrect(null);
           setPatternDetected(null);
-          makeComputerMove();
-        }, 2000);
+          if (autoPlayOpponent) {
+            playMasterMoveAt(opponentMoveIndex);
+          }
+        }, 1200);
 
         return true;
       } catch (error) {
@@ -483,22 +696,22 @@ export default function PlayableBoard({ game }) {
         return false;
       }
     } else {
-      console.log('✗ WRONG MOVE!');
-
       const newWrongAttempts = wrongAttempts + 1;
+      const WRONG_PENALTY = 25;
       setWrongAttempts(newWrongAttempts);
-      setStreak(0); // Break streak on wrong move
+      setTotalWrongAttempts(prev => prev + 1);
+      setStreak(0);
+      setScore(prev => Math.max(0, prev - WRONG_PENALTY));
 
-      // Auto-show hint after threshold
       if (newWrongAttempts >= autoHintThreshold) {
         const nextMove = getNextMasterMove();
-        setFeedback(`✗ Try ${nextMove.san} (${nextMove.from} to ${nextMove.to})`);
+        setFeedback(`✗ Wrong! -${WRONG_PENALTY} pts. Hint: ${nextMove.san} (${nextMove.from}→${nextMove.to})`);
         setOptionSquares({
           [nextMove.from]: { background: 'rgba(255, 215, 0, 0.7)' },
           [nextMove.to]: { background: 'rgba(76, 175, 80, 0.7)' }
         });
       } else {
-        setFeedback(`✗ Wrong move! Try again. (${newWrongAttempts}/${autoHintThreshold})`);
+        setFeedback(`✗ Wrong move! -${WRONG_PENALTY} pts. (${newWrongAttempts}/${autoHintThreshold} before hint)`);
       }
 
       setIsCorrect(false);
@@ -526,15 +739,20 @@ export default function PlayableBoard({ game }) {
     setFeedback('');
     setIsCorrect(null);
     setGameComplete(false);
-    setCustomArrows([]);
     setRightClickedSquares({});
 
     // Reset gamification stats
     setScore(0);
     setStreak(0);
     setWrongAttempts(0);
+    setTotalWrongAttempts(0);
     setMovesCompleted(0);
     setPatternDetected(null);
+
+    // If studying as Black, auto-play White's first move again
+    if (autoPlayOpponent && playingAs === 'black' && masterMoves.length > 0) {
+      playMasterMoveAt(0, masterMoves);
+    }
   };
 
   const goToNextMove = () => {
@@ -578,7 +796,9 @@ export default function PlayableBoard({ game }) {
   const showHint = () => {
     const nextMove = getNextMasterMove();
     if (nextMove) {
-      setFeedback(`Hint: The master played ${nextMove.san} (from ${nextMove.from} to ${nextMove.to})`);
+      const HINT_PENALTY = 50;
+      setScore(prev => Math.max(0, prev - HINT_PENALTY));
+      setFeedback(`💡 Hint: ${nextMove.san} (${nextMove.from}→${nextMove.to})  −${HINT_PENALTY} pts`);
 
       // Highlight the hint squares with pulsing effect
       setOptionSquares({
@@ -624,10 +844,19 @@ export default function PlayableBoard({ game }) {
     setRightClickedSquares(newRightClickedSquares);
   };
 
+  // Memoise threat data separately so we can use squareCounts in the JSX overlay
+  const threatData = useMemo(
+    () => calculateThreats(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [showThreats, position]
+  );
+
   const chessboardOptions = useMemo(() => {
     // Build square styles - only show legal moves and right-clicked squares
     const styles = {
       ...rightClickedSquares,
+      // Threat square highlights sit beneath legal-move highlights
+      ...(Object.keys(optionSquares).length === 0 ? threatData.squareStyles : {}),
       ...optionSquares,
     };
 
@@ -638,33 +867,22 @@ export default function PlayableBoard({ game }) {
       };
     }
 
-    // Combine all arrows: threats + custom arrows
-    const threatArrows = calculateThreats();
+    // Combine all arrows: think ahead + threats
+    const thinkAheadArrows = calculateThinkAheadArrows();
+    const threatArrows = threatData.arrows;
 
-    // Validate arrows - ensure all required fields are present
+    // Validate arrows — react-chessboard v5 Arrow: { startSquare, endSquare, color }
     const validatedArrows = [
+      ...thinkAheadArrows,
       ...threatArrows,
-      ...customArrows
-    ].filter(arrow => {
-      const isValid = arrow &&
-        typeof arrow.startSquare === 'string' &&
-        typeof arrow.endSquare === 'string' &&
-        arrow.startSquare.length === 2 &&
-        arrow.endSquare.length === 2 &&
-        typeof arrow.color === 'string';
-
-      if (!isValid) {
-        console.warn('Invalid arrow:', arrow);
-      }
-      return isValid;
-    });
+    ].filter(arrow =>
+      arrow &&
+      typeof arrow.startSquare === 'string' && arrow.startSquare.length === 2 &&
+      typeof arrow.endSquare === 'string' && arrow.endSquare.length === 2 &&
+      typeof arrow.color === 'string'
+    );
 
     const allArrows = validatedArrows;
-
-    if (allArrows.length > 0) {
-      console.log('All arrows:', allArrows.length, '(Threats:', threatArrows.length, 'Custom:', customArrows.length, ')');
-      console.log('Arrow samples:', allArrows.slice(0, 2));
-    }
 
     return {
       id: 'main-chessboard',
@@ -679,12 +897,8 @@ export default function PlayableBoard({ game }) {
       squareStyles: styles,
       animationDurationInMs: 300,
       allowDragging: !gameComplete,
-      allowDrawingArrows: thinkAheadMode, // Enable arrow drawing in think ahead mode
+      allowDrawingArrows: false, // Disable manual arrow drawing, we show calculated arrows
       arrows: allArrows.length > 0 ? allArrows : undefined, // Only pass arrows if we have any
-      onArrowsChange: thinkAheadMode ? ({ arrows }) => {
-        console.log('Arrows changed by user:', arrows);
-        setCustomArrows(arrows);
-      } : undefined,
       clearArrowsOnClick: false, // Don't clear arrows on click
       clearArrowsOnPositionChange: false, // Never auto-clear, we manage manually
       arrowOptions: {
@@ -709,17 +923,65 @@ export default function PlayableBoard({ game }) {
       //   background: 'rgba(255, 215, 0, 0.3)'
       // },
       darkSquareStyle: {
-        backgroundColor: '#B58863'
+        backgroundColor: '#8B6340'   // warm walnut — pairs with gold accent
       },
       lightSquareStyle: {
-        backgroundColor: '#F0D9B5'
+        backgroundColor: '#E8D9B5'   // warm parchment — pairs with cream text
       },
       showNotation: true,
-      boardOrientation: 'white',
+      boardOrientation: playingAs,
       showAnimations: true,
       dragActivationDistance: 3
     };
-  }, [position, optionSquares, rightClickedSquares, hoveredSquare, moveFrom, gameComplete, isDragging, showThreats, thinkAheadMode, customArrows]);
+  }, [position, optionSquares, rightClickedSquares, hoveredSquare, moveFrom, gameComplete, isDragging, threatData, thinkAheadMode, thinkAheadDepth, currentMoveIndex, playingAs, masterMoves]);
+
+  // ── Game Guide helpers ────────────────────────────────────────────
+  const TACTIC_THEMES = {
+    'queen-sacrifice': { icon: '♛', title: 'Queen Sacrifice', desc: 'Surrendering the most powerful piece to gain a decisive attack or material advantage elsewhere.' },
+    'fork':            { icon: '⚔️', title: 'Fork',           desc: 'One piece simultaneously attacks two or more enemy pieces, forcing a loss of material.' },
+    'pin':             { icon: '📌', title: 'Pin',            desc: 'A piece is unable to move without exposing a more valuable piece behind it.' },
+    'skewer':          { icon: '🏹', title: 'Skewer',         desc: 'The opposite of a pin — the more valuable piece must move, leaving the lesser piece to be captured.' },
+    'double-attack':   { icon: '⚔️', title: 'Double Attack',  desc: 'Two threats are created at once; the opponent can only parry one.' },
+    'tactics':         { icon: '⚡', title: 'Sharp Tactics',  desc: 'Concrete, calculated sequences that punish any imprecision from the opponent.' },
+    'king-hunt':       { icon: '🏹', title: 'King Hunt',      desc: 'The opposing king is chased across the board and mated by a coordinated piece attack.' },
+    'sacrifice':       { icon: '💎', title: 'Material Sacrifice', desc: 'Giving up material to gain a lasting initiative, attack, or positional compensation.' },
+    'back-rank':       { icon: '🚨', title: 'Back-Rank Mate', desc: 'Exploiting a back-rank weakness: the king is trapped by its own pawns.' },
+    'development':     { icon: '🚀', title: 'Rapid Development', desc: 'Swiftly mobilising all pieces — a key principle: time in the opening is material.' },
+    'attacking':       { icon: '⚡', title: 'King Attack',    desc: 'Coordinated piece and pawn assault targeting the opponent\'s king.' },
+    'king\'s-gambit':  { icon: '♟', title: 'King\'s Gambit',  desc: 'White offers a pawn on f4 for rapid development — the defining gambit of the romantic era.' },
+    'sicilian':        { icon: '♟', title: 'Sicilian Defence', desc: 'Black\'s sharpest answer to 1.e4, leading to asymmetric, tactical middlegames.' },
+    'ruy-lopez':       { icon: '♟', title: 'Ruy López',      desc: 'One of the oldest openings, targeting the e5 pawn with 3.Bb5 for long-term pressure.' },
+    'modern-defense':  { icon: '♟', title: 'Modern Defence', desc: 'Black allows White a big centre and plans to undermine it with piece pressure.' },
+    'world-championship': { icon: '🏆', title: 'World Championship', desc: 'Played under the ultimate competitive pressure — every move scrutinised by the chess world.' },
+    'computer-chess':  { icon: '🤖', title: 'Computer Chess', desc: 'Machine precision — moves chosen by calculation, not intuition.' },
+    'ai':              { icon: '🤖', title: 'AI Strategy',   desc: 'Demonstrates superhuman pattern recognition and tactical depth.' },
+    'legendary':       { icon: '⭐', title: 'Legendary Game', desc: 'One of the most studied and celebrated games ever played.' },
+    'prodigy':         { icon: '🌟', title: 'Child Prodigy',  desc: 'Played by a player far younger than expected for this level of mastery.' },
+    '19th-century':    { icon: '🕰️', title: '19th-Century Chess', desc: 'The romantic era — sacrifices and direct attacks prized above all.' },
+  };
+
+  const ECO_NOTES = {
+    A: 'A flank or irregular opening — White avoids 1.e4 or 1.d4, leading to rich strategic battles outside the main theoretical lines.',
+    B: 'A semi-open game — Black meets 1.e4 with a move other than 1…e5, creating asymmetric, fighting positions.',
+    C: 'An open game — both sides open the centre with 1.e4 e5, typically leading to sharp, tactical play.',
+    D: 'A closed or semi-closed game — solid pawn structures with long-term strategic planning after 1.d4 d5.',
+    E: 'An Indian defence — Black fights for control with knights before committing pawns, often hypermodern in character.',
+  };
+
+  const openingNote = ECO_NOTES[game?.eco?.[0]] || 'A complex opening requiring careful study of the plans and piece placement for both sides.';
+
+  const relevantThemes = (game?.tags || [])
+    .filter(t => TACTIC_THEMES[t])
+    .map(t => TACTIC_THEMES[t])
+    .slice(0, 4);
+
+  const phasePct = masterMoves.length > 0 ? currentMoveIndex / masterMoves.length : 0;
+  const gamePhase = phasePct < 0.25
+    ? { label: 'Opening',    color: '#4ade80', desc: 'Piece development and king safety' }
+    : phasePct < 0.65
+    ? { label: 'Middlegame', color: '#f59e0b', desc: 'Tactical and strategic battle' }
+    : { label: 'Endgame',    color: '#f87171', desc: 'Technical precision required' };
+  // ─────────────────────────────────────────────────────────────────
 
   if (!game) {
     return <div className="text-center py-12">Loading game...</div>;
@@ -727,6 +989,7 @@ export default function PlayableBoard({ game }) {
 
   return (
     <div className="playable-board-container">
+      <AuthGate difficulty={game.difficulty}>
       <Breadcrumbs
         items={[
           { label: 'Games', path: '/' },
@@ -734,23 +997,26 @@ export default function PlayableBoard({ game }) {
         ]}
       />
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 mt-6">
-        {/* Chess Board */}
-        <div className="lg:col-span-1">
-          <div className="bg-white rounded-lg shadow-lg p-4">
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-6 mt-6">
+        {/* Chess Board — 3/5 width so the board has room to breathe */}
+        <div className="lg:col-span-3">
+          <div className="chess-panel" style={{ padding: '1rem' }}>
             {/* Compact Header with Help */}
-            <div className="flex items-center justify-between mb-3">
-              <div className="text-sm text-gray-600">
-                Move {Math.floor(currentMoveIndex / 2) + 1} of {Math.ceil(masterMoves.length / 2)}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
+              <div className="move-counter">
+                Move&nbsp;
+                <span className="move-counter-current">{Math.floor(currentMoveIndex / 2) + 1}</span>
+                &nbsp;/&nbsp;
+                <span className="move-counter-total">{Math.ceil(masterMoves.length / 2)}</span>
               </div>
 
               {/* Help Button */}
-              <div className="relative">
+              <div style={{ position: 'relative' }}>
                 <button
                   onClick={() => setShowHelp(!showHelp)}
                   onMouseEnter={() => setShowHelp(true)}
                   onMouseLeave={() => setShowHelp(false)}
-                  className="w-8 h-8 rounded-full bg-blue-100 hover:bg-blue-200 text-blue-600 flex items-center justify-center transition-colors"
+                  className="help-btn"
                   title="How to Play"
                 >
                   ?
@@ -758,35 +1024,99 @@ export default function PlayableBoard({ game }) {
 
                 {/* Help Tooltip */}
                 {showHelp && (
-                  <div className="absolute right-0 top-10 w-72 bg-white border-2 border-blue-200 rounded-lg shadow-xl p-4 z-50">
-                    <h3 className="font-bold text-blue-900 mb-2">How to Play</h3>
-                    <ul className="text-xs text-gray-700 space-y-1">
-                      <li>• <strong>Drag & Drop</strong> or <strong>click-to-move</strong> pieces</li>
-                      <li>• Replicate the master's moves to earn points</li>
-                      <li>• Build streaks for bonus points 🔥</li>
-                      <li>• After 3 wrong moves, auto-hint appears</li>
-                      <li>• <strong>Think Ahead</strong>: Draw arrows (right-click drag)</li>
-                      <li>• <strong>Show Threats</strong>: See checks/captures</li>
+                  <div className="chess-tooltip" style={{ position: 'absolute', right: 0, top: '2.25rem', width: '17rem', zIndex: 50 }}>
+                    <p style={{ fontFamily: '"Playfair Display", serif', fontWeight: 600, color: '#ece8df', fontSize: '0.875rem', marginBottom: '0.5rem' }}>How to Play</p>
+                    <ul style={{ listStyle: 'none', padding: 0, margin: 0, color: '#b2aec4', lineHeight: 1.85 }}>
+                      <li>· <strong style={{ color: '#ece8df' }}>Drag & drop</strong> or <strong style={{ color: '#ece8df' }}>click-to-move</strong> pieces</li>
+                      <li>· Match the master's moves to earn points</li>
+                      <li>· Build streaks for bonus points 🔥</li>
+                      <li>· After 3 wrong moves, an auto-hint appears</li>
+                      <li>· <strong style={{ color: '#c9a84c' }}>Think Ahead</strong>: see upcoming master moves</li>
+                      <li>· <strong style={{ color: '#c9a84c' }}>Threat Analysis</strong>: attacker / defender counts</li>
                     </ul>
                   </div>
                 )}
               </div>
             </div>
 
-            <Chessboard
-              key={`board-${boardKey}`}
-              id="main-chessboard"
-              options={chessboardOptions}
-            />
+            <div style={{ position: 'relative' }}>
+              <Chessboard
+                key={`board-${boardKey}`}
+                id="main-chessboard"
+                options={chessboardOptions}
+              />
+
+              {/* Attacker / defender count overlay — shown only when Show Threats is on */}
+              {showThreats && Object.keys(threatData.squareCounts).length > 0 && (
+                <div
+                  aria-hidden="true"
+                  style={{
+                    position: 'absolute',
+                    // Inset to align with the 8×8 squares (react-chessboard leaves ~12.5% for notation)
+                    top: '0%', left: '0%', right: '0%', bottom: '0%',
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(8, 1fr)',
+                    gridTemplateRows: 'repeat(8, 1fr)',
+                    pointerEvents: 'none',
+                  }}
+                >
+                  {(() => {
+                    const files = playingAs === 'white'
+                      ? ['a','b','c','d','e','f','g','h']
+                      : ['h','g','f','e','d','c','b','a'];
+                    const ranks = playingAs === 'white'
+                      ? [8,7,6,5,4,3,2,1]
+                      : [1,2,3,4,5,6,7,8];
+
+                    return ranks.flatMap((rank, rowIdx) =>
+                      files.map((file, colIdx) => {
+                        const square = `${file}${rank}`;
+                        const counts = threatData.squareCounts[square];
+                        if (!counts) return <div key={square} />;
+
+                        const net = counts.attackers - counts.defenders;
+                        const labelColor = net > 0 ? '#fff' : net === 0 ? '#1a1200' : '#0a2e0a';
+
+                        return (
+                          <div
+                            key={square}
+                            style={{
+                              display: 'flex',
+                              flexDirection: 'column',
+                              alignItems: 'flex-end',
+                              justifyContent: 'flex-end',
+                              padding: '1px 2px',
+                            }}
+                          >
+                            <span
+                              style={{
+                                fontSize: '9px',
+                                fontWeight: '700',
+                                lineHeight: 1.1,
+                                color: labelColor,
+                                textShadow: '0 0 3px rgba(0,0,0,0.6)',
+                                userSelect: 'none',
+                              }}
+                            >
+                              {counts.attackers}A {counts.defenders}D
+                            </span>
+                          </div>
+                        );
+                      })
+                    );
+                  })()}
+                </div>
+              )}
+            </div>
 
             {/* Feedback */}
             {feedback && (
-              <div className={`mt-4 p-4 rounded-lg text-center font-semibold ${
+              <div className={`toast-chess ${
                 isCorrect === true
-                  ? 'bg-green-100 text-green-800'
+                  ? 'toast-chess-success'
                   : isCorrect === false
-                  ? 'bg-red-100 text-red-800'
-                  : 'bg-blue-100 text-blue-800'
+                  ? 'toast-chess-error'
+                  : 'toast-chess-info'
               }`}>
                 {feedback}
               </div>
@@ -794,67 +1124,99 @@ export default function PlayableBoard({ game }) {
           </div>
         </div>
 
-        {/* Game Info */}
-        <div className="lg:col-span-1 space-y-6">
-          {/* Gamification Panel */}
-          <div className="bg-gradient-to-br from-purple-500 to-indigo-600 rounded-lg shadow-lg p-4 text-white">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-lg font-bold flex items-center gap-2">
-                🎮 Progress
-              </h3>
-              <div className="text-right">
-                <div className="text-2xl font-bold">{score}</div>
-                <div className="text-xs opacity-75">points</div>
+        {/* Game Info — 2/5 width sidebar */}
+        <div className="lg:col-span-2 space-y-4">
+          {/* Progress Panel */}
+          <div className="chess-panel">
+            {/* Score row */}
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: '1rem' }}>
+              <div>
+                <p className="chess-section-label" style={{ marginBottom: '0.2rem' }}>Your Progress</p>
+                <p style={{ fontFamily: '"Playfair Display", serif', fontSize: '1rem', fontWeight: 600, color: '#ece8df', margin: 0 }}>
+                  Game Score
+                </p>
               </div>
-            </div>
-
-            <div className="grid grid-cols-3 gap-2 mb-3">
-              <div className="bg-white/20 rounded p-2 text-center backdrop-blur">
-                <div className="text-lg font-bold">🔥{streak}</div>
-                <div className="text-xs opacity-90">Streak</div>
-              </div>
-              <div className="bg-white/20 rounded p-2 text-center backdrop-blur">
-                <div className="text-lg font-bold">{movesCompleted}</div>
-                <div className="text-xs opacity-90">Moves</div>
-              </div>
-              <div className="bg-white/20 rounded p-2 text-center backdrop-blur">
-                <div className="text-lg font-bold">
-                  {movesCompleted > 0 ? Math.round((movesCompleted / (movesCompleted + (streak === 0 && wrongAttempts > 0 ? 1 : 0))) * 100) : 100}%
+              <div style={{ textAlign: 'right' }}>
+                <div style={{ fontFamily: '"Playfair Display", serif', fontSize: '2rem', fontWeight: 700, color: '#c9a84c', lineHeight: 1 }}>
+                  {score}
                 </div>
-                <div className="text-xs opacity-90">Accuracy</div>
+                <div className="chess-section-label" style={{ marginTop: '0.2rem' }}>points</div>
               </div>
             </div>
 
-            {/* Pattern Achievement */}
+            {/* Live stats */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem', marginBottom: '0.875rem' }}>
+              <div className="chess-stat-pill">
+                <div className="chess-stat-pill-value">🔥 {streak}</div>
+                <div className="chess-stat-pill-label">Streak</div>
+              </div>
+              <div className="chess-stat-pill">
+                <div className="chess-stat-pill-value">{movesCompleted}</div>
+                <div className="chess-stat-pill-label">Moves</div>
+              </div>
+              <div className="chess-stat-pill">
+                <div className="chess-stat-pill-value" style={{ color: '#c9a84c' }}>
+                  {movesCompleted > 0
+                    ? Math.round((movesCompleted / (movesCompleted + totalWrongAttempts)) * 100)
+                    : 100}%
+                </div>
+                <div className="chess-stat-pill-label">Accuracy</div>
+              </div>
+            </div>
+
+            {/* Personal bests */}
+            {(gameProgress.bestScore > 0 || gameProgress.completions > 0) && (
+              <div className="personal-best-row">
+                <div>
+                  <span className="chess-section-label">Best&nbsp;</span>
+                  <span style={{ color: '#c9a84c', fontWeight: 700, fontSize: '0.78rem' }}>{gameProgress.bestScore} pts</span>
+                </div>
+                <div>
+                  <span className="chess-section-label">Played&nbsp;</span>
+                  <span style={{ color: '#ece8df', fontWeight: 600, fontSize: '0.78rem' }}>{gameProgress.completions}×</span>
+                </div>
+                {gameProgress.lastAccuracy > 0 && (
+                  <div>
+                    <span className="chess-section-label">Acc&nbsp;</span>
+                    <span style={{ color: '#c9a84c', fontWeight: 700, fontSize: '0.78rem' }}>{gameProgress.lastAccuracy}%</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Tactical pattern badge */}
             {patternDetected && patternDetected.length > 0 && (
-              <div className="bg-yellow-400 text-yellow-900 rounded-lg p-2 animate-pulse mb-2">
-                <div className="font-bold text-xs mb-1">🎯 Tactical!</div>
+              <div className="tactical-badge">
+                <div className="chess-section-label" style={{ color: '#c9a84c', marginBottom: '0.2rem' }}>🎯 Tactical Pattern</div>
                 {patternDetected.map((pattern, idx) => (
-                  <div key={idx} className="text-xs">
+                  <div key={idx} style={{ fontSize: '0.8rem', color: '#ece8df' }}>
                     +{pattern.points} {pattern.description}
                   </div>
                 ))}
               </div>
             )}
 
-            {/* Auto-hint indicator */}
+            {/* Wrong-move counter */}
             {wrongAttempts > 0 && wrongAttempts < autoHintThreshold && (
-              <div className="bg-orange-400 text-orange-900 rounded p-1.5 text-xs">
-                {autoHintThreshold - wrongAttempts} more {autoHintThreshold - wrongAttempts === 1 ? 'try' : 'tries'} → auto-hint
+              <div className="attempts-badge">
+                <span>⚠</span>
+                <span>
+                  {autoHintThreshold - wrongAttempts} {autoHintThreshold - wrongAttempts === 1 ? 'try' : 'tries'} left before auto-hint (−25 pts each wrong move)
+                </span>
               </div>
             )}
           </div>
 
           {/* Controls Section */}
-          <div className="bg-white rounded-lg shadow-lg p-4 space-y-3">
-            <h3 className="font-bold text-gray-800 mb-3">Controls</h3>
+          <div className="chess-panel">
+            <p className="chess-section-label" style={{ marginBottom: '0.875rem' }}>Controls</p>
 
             {/* Navigation */}
-            <div className="grid grid-cols-2 gap-2">
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', marginBottom: '0.5rem' }}>
               <button
                 onClick={goToPreviousMove}
                 disabled={currentMoveIndex === 0}
-                className="px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium"
+                className="btn-chess-secondary"
                 title="Previous Move"
               >
                 ← Prev
@@ -862,7 +1224,7 @@ export default function PlayableBoard({ game }) {
               <button
                 onClick={goToNextMove}
                 disabled={currentMoveIndex >= masterMoves.length}
-                className="px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium"
+                className="btn-chess-secondary"
                 title="Next Move"
               >
                 Next →
@@ -870,121 +1232,190 @@ export default function PlayableBoard({ game }) {
             </div>
 
             {/* Actions */}
-            <div className="grid grid-cols-2 gap-2">
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
               <button
                 onClick={resetGame}
-                className="px-3 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-colors text-sm font-medium"
+                className="btn-chess-utility"
                 title="Reset Game"
               >
-                🔄 Reset
+                ↺ Reset
               </button>
               <button
                 onClick={showHint}
                 disabled={gameComplete}
-                className="px-3 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 transition-colors disabled:opacity-50 text-sm font-medium"
-                title="Show Hint"
+                className="btn-chess-secondary"
+                title="Show Hint (−50 pts)"
               >
                 💡 Hint
               </button>
             </div>
 
+            <div className="chess-divider" />
+
             {/* Analysis Tools */}
-            <div className="space-y-2">
-              <button
-                onClick={() => setThinkAheadMode(!thinkAheadMode)}
-                className={`w-full px-3 py-2 rounded text-sm font-medium transition-colors ${
-                  thinkAheadMode
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                }`}
-                title="Right-click drag to draw arrows"
-              >
-                {thinkAheadMode ? '✓' : ''} 🎯 Think Ahead Mode
-              </button>
+            <p className="chess-section-label" style={{ marginBottom: '0.625rem' }}>Analysis</p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              <div>
+                <button
+                  onClick={() => setThinkAheadMode(!thinkAheadMode)}
+                  className={thinkAheadMode ? 'btn-chess-toggle-active' : 'btn-chess-toggle'}
+                  title="Show next N moves from the master game"
+                >
+                  🎯 Think Ahead {thinkAheadMode ? '✓' : ''}
+                </button>
+                {thinkAheadMode && (
+                  <div style={{ marginTop: '0.625rem', padding: '0 0.25rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.375rem' }}>
+                      <span className="chess-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', fontSize: '0.75rem' }}>Moves ahead</span>
+                      <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#c9a84c' }}>{thinkAheadDepth}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="1"
+                      max="5"
+                      value={thinkAheadDepth}
+                      onChange={(e) => setThinkAheadDepth(Number(e.target.value))}
+                      className="chess-range"
+                    />
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.68rem', color: '#8a8698', marginTop: '0.25rem' }}>
+                      <span>1</span><span>5</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+
               <button
                 onClick={() => setShowThreats(!showThreats)}
-                className={`w-full px-3 py-2 rounded text-sm font-medium transition-colors ${
-                  showThreats
-                    ? 'bg-purple-600 text-white'
-                    : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                }`}
-                title="Show checks (red) and captures (orange)"
+                className={showThreats ? 'btn-chess-toggle-active' : 'btn-chess-toggle'}
+                title="Show attacker / defender counts per piece"
               >
-                {showThreats ? '✓' : ''} ⚠️ Show Threats
+                ⚠️ Threat Analysis {showThreats ? '✓' : ''}
               </button>
-              {thinkAheadMode && customArrows.length > 0 && (
-                <button
-                  onClick={() => setCustomArrows([])}
-                  className="w-full px-3 py-2 bg-red-600 text-white rounded text-sm font-medium hover:bg-red-700"
-                  title="Clear all drawn arrows"
-                >
-                  Clear Arrows ({customArrows.length})
-                </button>
+
+              {/* Threat legend */}
+              {showThreats && (
+                <div className="threat-legend">
+                  <p className="chess-section-label" style={{ marginBottom: '0.375rem' }}>
+                    Square colour · "NA ND" = attackers / defenders
+                  </p>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.2rem 0.5rem', fontSize: '0.7rem', color: '#b2aec4' }}>
+                    {[
+                      { bg: 'rgba(220,38,38,0.55)',  label: 'Hanging' },
+                      { bg: 'rgba(239,68,68,0.38)',  label: 'Under-defended' },
+                      { bg: 'rgba(245,158,11,0.40)', label: 'Contested' },
+                      { bg: 'rgba(34,197,94,0.28)',  label: 'Well defended' },
+                    ].map(({ bg, label }) => (
+                      <span key={label} style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                        <span style={{ width: 8, height: 8, borderRadius: 2, background: bg, flexShrink: 0, display: 'inline-block' }} />
+                        {label}
+                      </span>
+                    ))}
+                  </div>
+                </div>
               )}
             </div>
-          </div>
 
-          <div className="bg-white rounded-lg shadow-lg p-6">
-            <h2 className="text-2xl font-bold mb-4">{game.white} vs {game.black}</h2>
+            <div className="chess-divider" />
 
-            <div className="space-y-3 text-sm">
+            {/* Study Mode */}
+            <p className="chess-section-label" style={{ marginBottom: '0.625rem' }}>Study Mode</p>
+
+            <button
+              onClick={() => setAutoPlayOpponent(prev => !prev)}
+              className={autoPlayOpponent ? 'btn-chess-toggle-active' : 'btn-chess-toggle'}
+              style={{ marginBottom: autoPlayOpponent ? '0.625rem' : 0 }}
+              title="Opponent moves are played automatically — focus on one side only"
+            >
+              ⚡ Auto-play Opponent {autoPlayOpponent ? '✓' : ''}
+            </button>
+
+            {autoPlayOpponent && (
               <div>
-                <span className="font-semibold text-gray-700">Event:</span>
-                <p className="text-gray-600">{game.event}</p>
-              </div>
-
-              <div>
-                <span className="font-semibold text-gray-700">Date:</span>
-                <p className="text-gray-600">{game.date}</p>
-              </div>
-
-              <div>
-                <span className="font-semibold text-gray-700">Opening:</span>
-                <p className="text-gray-600">{game.opening} ({game.eco})</p>
-              </div>
-
-              <div>
-                <span className="font-semibold text-gray-700">Result:</span>
-                <p className="text-gray-600">{game.result}</p>
-              </div>
-
-              <div>
-                <span className="font-semibold text-gray-700">Difficulty:</span>
-                <span className={`inline-block ml-2 px-2 py-1 rounded text-xs ${
-                  game.difficulty === 'beginner'
-                    ? 'bg-green-100 text-green-800'
-                    : game.difficulty === 'intermediate'
-                    ? 'bg-yellow-100 text-yellow-800'
-                    : 'bg-orange-100 text-orange-800'
-                }`}>
-                  {game.difficulty}
-                </span>
-              </div>
-            </div>
-
-            <div className="mt-6">
-              <h3 className="font-semibold text-gray-700 mb-2">About This Game</h3>
-              <p className="text-sm text-gray-600">{game.description}</p>
-            </div>
-
-            {game.tags && (
-              <div className="mt-6">
-                <h3 className="font-semibold text-gray-700 mb-2">Tags</h3>
-                <div className="flex flex-wrap gap-2">
-                  {game.tags.map((tag, index) => (
-                    <span
-                      key={index}
-                      className="inline-block bg-gray-100 text-gray-700 text-xs px-2 py-1 rounded"
-                    >
-                      #{tag}
-                    </span>
-                  ))}
+                <p className="chess-section-label" style={{ marginBottom: '0.375rem' }}>Playing as</p>
+                <div className="playing-as-group">
+                  <button
+                    onClick={() => setPlayingAs('white')}
+                    className={playingAs === 'white' ? 'playing-as-btn-active' : 'playing-as-btn'}
+                  >
+                    ♔ White
+                  </button>
+                  <button
+                    onClick={() => setPlayingAs('black')}
+                    className={playingAs === 'black' ? 'playing-as-btn-active' : 'playing-as-btn'}
+                  >
+                    ♚ Black
+                  </button>
                 </div>
               </div>
             )}
           </div>
+
+          {/* Game Guide */}
+          <div className="chess-panel">
+            <h2 style={{ fontFamily: '"Playfair Display", serif', fontSize: '1.15rem', fontWeight: 700, color: '#ece8df', margin: '0 0 0.2rem' }}>
+              {game.white} vs {game.black}
+            </h2>
+            <p style={{ fontSize: '0.72rem', color: '#8a8698', margin: '0 0 1.25rem' }}>
+              {game.event} · {game.date} ·{' '}
+              <span style={{ color: '#c9a84c', fontWeight: 600 }}>{game.result}</span>
+            </p>
+
+            {/* Phase progress bar */}
+            <div style={{ marginBottom: '1.25rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.375rem' }}>
+                <span className="chess-section-label">Game Phase</span>
+                <span style={{ fontSize: '0.72rem', fontWeight: 600, color: gamePhase.color }}>{gamePhase.label}</span>
+              </div>
+              <div className="progress-bar-track">
+                <div className="progress-bar-fill" style={{ width: `${phasePct * 100}%`, background: gamePhase.color }} />
+              </div>
+              <p style={{ fontSize: '0.68rem', color: '#8a8698', margin: '0.3rem 0 0' }}>
+                Move {currentMoveIndex} of {masterMoves.length} · {gamePhase.desc}
+              </p>
+            </div>
+
+            {/* Opening */}
+            <div style={{ marginBottom: '1.25rem', paddingBottom: '1.25rem', borderBottom: '1px solid #252535' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.375rem', marginBottom: '0.5rem' }}>
+                <span style={{ fontSize: '0.85rem' }}>♟</span>
+                <span className="chess-section-label">Opening</span>
+                {game.eco && (
+                  <span style={{ marginLeft: 'auto', fontSize: '0.68rem', color: '#8a8698', fontFamily: 'monospace', background: '#1c1c28', border: '1px solid #252535', padding: '0.1rem 0.4rem', borderRadius: '0.25rem' }}>
+                    {game.eco}
+                  </span>
+                )}
+              </div>
+              <p style={{ fontSize: '0.875rem', fontWeight: 600, color: '#ece8df', margin: '0 0 0.375rem' }}>{game.opening}</p>
+              <p style={{ fontSize: '0.78rem', color: '#b2aec4', margin: 0, lineHeight: 1.65 }}>{openingNote}</p>
+            </div>
+
+            {/* Tactical themes */}
+            {relevantThemes.length > 0 && (
+              <div style={{ marginBottom: '1.25rem', paddingBottom: '1.25rem', borderBottom: '1px solid #252535' }}>
+                <p className="chess-section-label" style={{ marginBottom: '0.75rem' }}>Tactical Themes</p>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                  {relevantThemes.map((theme, i) => (
+                    <div key={i} style={{ display: 'flex', gap: '0.625rem', alignItems: 'flex-start' }}>
+                      <span style={{ fontSize: '1rem', lineHeight: 1, marginTop: '0.1rem', flexShrink: 0 }}>{theme.icon}</span>
+                      <div>
+                        <p style={{ fontSize: '0.8rem', fontWeight: 600, color: '#ece8df', margin: '0 0 0.15rem' }}>{theme.title}</p>
+                        <p style={{ fontSize: '0.75rem', color: '#b2aec4', margin: 0, lineHeight: 1.6 }}>{theme.desc}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* About */}
+            <div>
+              <p className="chess-section-label" style={{ marginBottom: '0.375rem' }}>About This Game</p>
+              <p style={{ fontSize: '0.78rem', color: '#b2aec4', margin: 0, lineHeight: 1.7 }}>{game.description}</p>
+            </div>
+          </div>
         </div>
       </div>
+      </AuthGate>
     </div>
   );
 }

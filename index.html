@@ -5,6 +5,20 @@
 		<link rel="icon" type="image/svg+xml" href="/vite.svg" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 		<title>Chess Masters - Learn from the Greats</title>
+		<!-- Clerk loaded only when publishable key is present -->
+		<script>
+			(function() {
+				var key = '__VITE_CLERK_KEY__';
+				if (key && key !== '__VITE_CLERK_KEY__' && !key.startsWith('__')) {
+					var s = document.createElement('script');
+					s.setAttribute('data-clerk-publishable-key', key);
+					s.async = true;
+					s.crossOrigin = 'anonymous';
+					s.src = 'https://cdn.jsdelivr.net/npm/@clerk/clerk-js@latest/dist/clerk.browser.js';
+					document.head.appendChild(s);
+				}
+			})();
+		</script>
 	</head>
 	<body>
 		<div id="root"></div>

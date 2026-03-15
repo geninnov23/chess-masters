@@ -26,6 +26,13 @@
       }
     ],
     */
+	"d1_databases": [
+		{
+			"binding": "chess_masters_db",
+			"database_name": "chess-masters-db",
+			"database_id": "cd5d1a93-0484-4b3e-b595-7cb43cafada6"
+		}
+	],
 	"placement": {
 		"mode": "smart"
 	},

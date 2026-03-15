@@ -11,6 +11,8 @@ createRoot(document.getElementById("root")).render(
 				<Route path="/" element={<App />} />
 				<Route path="/category/:categoryId" element={<App />} />
 				<Route path="/game/:gameId" element={<App />} />
+				<Route path="/blog" element={<App page="blog" />} />
+				<Route path="/blog/:slug" element={<App page="blog-post" />} />
 			</Routes>
 		</BrowserRouter>
 	</StrictMode>,
